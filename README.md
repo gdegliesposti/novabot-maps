@@ -47,7 +47,7 @@ Uso come modulo in un server esistente:
 ```js
 const express = require('express');
 const app = express();
-app.use('/editor', require('./novabot-maps/pathRoutes'));
+app.use('/editor', require('./routes/pathRoutes'));
 ```
 
 ---
