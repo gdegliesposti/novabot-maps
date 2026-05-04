@@ -2,15 +2,15 @@
  * editor.js
  * Frontend canvas-based path editor - multi-percorso.
  *
- * Stato globale frontend:
- *   multiState.paths       = array di tutti i percorsi (con punti)
- *   multiState.activePathId = id del percorso in editing
+ * multiState  = copia locale di tutti i percorsi
+ * state       = percorso attivo (punti, closed, selectedId)
  *
- * Il campo "state" (points, closed, selectedId) rispecchia sempre
- * il percorso attivo ed e' l'unico su cui operano gli strumenti di editing.
+ * Regola di sincronizzazione:
+ *   dopo ogni modifica al percorso attivo -> syncActiveToMulti()
+ *   dopo ogni cambio di percorso attivo   -> loadActiveFromMulti()
  */
 
-// -- State locale del percorso attivo -----------------------------------------
+// ── State locale del percorso attivo ─────────────────────────────────────────
 
 const state = {
   points:     [],
@@ -18,14 +18,15 @@ const state = {
   selectedId: null,
 };
 
-// -- Stato multi-percorso ------------------------------------------------------
+// ── Stato multi-percorso ──────────────────────────────────────────────────────
 
 const multiState = {
-  paths:        [],   // copia locale di tutti i percorsi (con punti)
+  paths:        [],
   activePathId: null,
 };
 
-// Viewport transform: screen = world * zoom + pan
+// ── Viewport ──────────────────────────────────────────────────────────────────
+
 const view = {
   zoom: 1,
   panX: 0,
@@ -34,32 +35,29 @@ const view = {
 
 let lastFitView = { zoom: 1, panX: 0, panY: 0 };
 
-// -- Undo / Redo ---------------------------------------------------------------
-// Snapshot completo dell'intero multiState per supportare operazioni
-// che creano/eliminano/rinominano percorsi oltre a modificare punti.
+// ── Undo / Redo ───────────────────────────────────────────────────────────────
 
 const undoStack = [];
 const redoStack = [];
 const UNDO_LIMIT = 50;
 
-function snapMulti() {
-  return {
-    paths:        multiState.paths.map(p => ({
-      ...p,
-      points: p.points.map(pt => ({ ...pt })),
-    })),
-    activePathId: multiState.activePathId,
-  };
-}
-
+/**
+ * Snapshot completo: stato del percorso attivo + intero multiState.
+ * Usato per undo/redo che devono ripristinare anche creazione/eliminazione
+ * percorsi e cambio percorso attivo.
+ */
 function snapState() {
-  // Snapshot legacy (solo percorso attivo) - usato dalle operazioni di editing
   return {
     points:     state.points.map(p => ({ ...p })),
     closed:     state.closed,
     selectedId: state.selectedId,
-    // Conserva anche il contesto multi per undo completo
-    _multi:     snapMulti(),
+    multi: {
+      paths:        multiState.paths.map(p => ({
+        ...p,
+        points: p.points.map(pt => ({ ...pt })),
+      })),
+      activePathId: multiState.activePathId,
+    },
   };
 }
 
@@ -72,30 +70,29 @@ function pushUndo(before) {
 
 function commitUndo() {
   const entry = undoStack[undoStack.length - 1];
-  if (entry && !entry.after) {
-    entry.after = snapState();
-  }
+  if (entry && !entry.after) entry.after = snapState();
   updateUndoButtons();
 }
 
 async function applySnapshot(snap) {
-  // Se lo snapshot contiene il contesto multi, ripristina l'intero store
-  if (snap._multi) {
-    await apiPost('/api/path/paths/fullstate', {
-      paths:        snap._multi.paths,
-      activePathId: snap._multi.activePathId,
-    });
-    multiState.paths        = snap._multi.paths.map(p => ({
-      ...p, points: p.points.map(pt => ({ ...pt })),
-    }));
-    multiState.activePathId = snap._multi.activePathId;
-  } else {
-    // Undo legacy (solo percorso attivo)
-    await apiPost('/api/path/state', { points: snap.points, closed: snap.closed });
-  }
+  // Ripristina l'intero store sul server
+  await apiPost('/api/path/paths/fullstate', {
+    paths:        snap.multi.paths,
+    activePathId: snap.multi.activePathId,
+  });
+
+  // Ripristina multiState locale
+  multiState.paths        = snap.multi.paths.map(p => ({
+    ...p,
+    points: p.points.map(pt => ({ ...pt })),
+  }));
+  multiState.activePathId = snap.multi.activePathId;
+
+  // Ripristina state del percorso attivo
   state.points     = snap.points.map(p => ({ ...p }));
   state.closed     = snap.closed;
   state.selectedId = snap.selectedId;
+
   updateUI();
 }
 
@@ -124,7 +121,7 @@ function updateUndoButtons() {
   if (btnRedo) btnRedo.disabled = redoStack.length === 0;
 }
 
-// -- Tool / interaction state --------------------------------------------------
+// ── Tool / interaction state ──────────────────────────────────────────────────
 
 let currentTool   = 'add';
 let isPanning     = false;
@@ -142,7 +139,7 @@ let hoveredSegIdx = -1;
 let ghostPoint    = null;
 let zoomRect      = null;
 
-// -- Canvas setup --------------------------------------------------------------
+// ── Canvas setup ──────────────────────────────────────────────────────────────
 
 const canvas = document.getElementById('canvas');
 const ctx    = canvas.getContext('2d');
@@ -155,7 +152,7 @@ function resizeCanvas() {
 }
 window.addEventListener('resize', resizeCanvas);
 
-// -- Coordinate helpers --------------------------------------------------------
+// ── Coordinate helpers ────────────────────────────────────────────────────────
 
 function screenToWorld(sx, sy) {
   return {
@@ -171,24 +168,30 @@ function worldToScreen(wx, wy) {
   };
 }
 
-// -- Rendering -----------------------------------------------------------------
+// ── Rendering ─────────────────────────────────────────────────────────────────
 
 const POINT_R       = 5;
 const POINT_R_HOVER = 8;
 const GRID_STEP     = 50;
 
-// Palette colori per percorsi non attivi (ciclica)
-const PATH_COLORS = [
-  'rgba(168,85,247,0.55)',   // viola
-  'rgba(251,146,60,0.55)',   // arancio
-  'rgba(52,211,153,0.55)',   // verde
-  'rgba(251,191,36,0.55)',   // giallo
-  'rgba(236,72,153,0.55)',   // rosa
+// Palette colori per percorsi non attivi.
+// Il colore e' assegnato in base a (path.id % lunghezza palette) cosi'
+// rimane stabile anche dopo eliminazione di altri percorsi. (Bug 3 fix)
+const PATH_PALETTE = [
+  { seg: 'rgba(168,85,247,0.6)',  pt: 'rgba(168,85,247,0.85)',  label: 'rgba(168,85,247,0.7)'  },
+  { seg: 'rgba(251,146,60,0.6)',  pt: 'rgba(251,146,60,0.85)',  label: 'rgba(251,146,60,0.7)'  },
+  { seg: 'rgba(52,211,153,0.6)',  pt: 'rgba(52,211,153,0.85)',  label: 'rgba(52,211,153,0.7)'  },
+  { seg: 'rgba(251,191,36,0.6)',  pt: 'rgba(251,191,36,0.85)',  label: 'rgba(251,191,36,0.7)'  },
+  { seg: 'rgba(236,72,153,0.6)',  pt: 'rgba(236,72,153,0.85)',  label: 'rgba(236,72,153,0.7)'  },
 ];
 
-function pathColor(pathId) {
-  const idx = multiState.paths.findIndex(p => p.id === pathId);
-  return PATH_COLORS[idx % PATH_COLORS.length];
+function paletteFor(pathId) {
+  return PATH_PALETTE[pathId % PATH_PALETTE.length];
+}
+
+// Colore CSS da usare nella sidebar (stringa rgba)
+function colorForId(pathId) {
+  return PATH_PALETTE[pathId % PATH_PALETTE.length].pt;
 }
 
 function render() {
@@ -206,40 +209,35 @@ function render() {
   ctx.translate(view.panX, view.panY);
   ctx.scale(view.zoom, -view.zoom);
 
-  // Disegna prima tutti i percorsi non attivi (sfondo)
+  // Prima i percorsi non attivi (sfondo)
   multiState.paths.forEach(path => {
-    if (path.id !== multiState.activePathId) {
-      drawPathInactive(path);
-    }
+    if (path.id !== multiState.activePathId) drawPathInactive(path);
   });
 
-  // Disegna il percorso attivo sopra (con hover, ghost, ecc.)
+  // Poi il percorso attivo (in primo piano, con hover e ghost)
   drawChain();
   drawPoints();
 
   ctx.restore();
 
-  // Rubber-band (zoom o erase) in screen space
+  // Rubber-band in screen space
   if (zoomRect !== null) {
     if (currentTool === 'zoom')  drawZoomRect(false);
     if (currentTool === 'erase') drawZoomRect(true);
   }
 }
 
-/**
- * Disegna un percorso non attivo con colore attenuato e senza interazioni.
- */
 function drawPathInactive(path) {
   const pts = path.points;
   const n   = pts.length;
-  if (n < 1) return;
+  if (n === 0) return;
 
-  const color    = pathColor(path.id);
+  const pal      = paletteFor(path.id);
   const segCount = path.closed ? n : Math.max(0, n - 1);
 
-  ctx.strokeStyle = color;
+  // Segmenti
+  ctx.strokeStyle = pal.seg;
   ctx.lineWidth   = 1.2 / view.zoom;
-
   for (let i = 0; i < segCount; i++) {
     const a = pts[i];
     const b = pts[(i + 1) % n];
@@ -250,23 +248,23 @@ function drawPathInactive(path) {
   }
 
   // Punti
-  const pr = POINT_R * 0.7 / view.zoom;
+  const pr = POINT_R * 0.75 / view.zoom;
+  ctx.fillStyle = pal.pt;
   pts.forEach(p => {
     ctx.beginPath();
     ctx.arc(p.x, p.y, pr, 0, Math.PI * 2);
-    ctx.fillStyle = color;
     ctx.fill();
   });
 
-  // Label nome percorso sul primo punto (se zoom sufficiente)
-  if (n > 0 && view.zoom > 0.3) {
+  // Nome del percorso sul primo punto (solo se zoom sufficiente)
+  if (view.zoom > 0.25 && pts.length > 0) {
     const fp = pts[0];
     ctx.save();
     ctx.translate(fp.x, fp.y);
     ctx.scale(1, -1);
-    ctx.fillStyle = color;
+    ctx.fillStyle = pal.label;
     ctx.font = (11 / view.zoom) + 'px JetBrains Mono, monospace';
-    ctx.fillText(path.name, POINT_R / view.zoom + 2 / view.zoom, -4 / view.zoom);
+    ctx.fillText(path.name, pr + 4 / view.zoom, -3 / view.zoom);
     ctx.restore();
   }
 }
@@ -278,15 +276,12 @@ function drawZoomRect(isErase) {
   const rx = Math.min(x0, x1), ry = Math.min(y0, y1);
   const rw = Math.abs(x1 - x0), rh = Math.abs(y1 - y0);
 
-  const stroke = isErase ? 'rgba(255,68,68,0.9)'  : 'rgba(74,222,128,0.9)';
-  const fill   = isErase ? 'rgba(255,68,68,0.08)' : 'rgba(74,222,128,0.06)';
-
   ctx.save();
-  ctx.strokeStyle = stroke;
+  ctx.strokeStyle = isErase ? 'rgba(255,68,68,0.9)'  : 'rgba(74,222,128,0.9)';
+  ctx.fillStyle   = isErase ? 'rgba(255,68,68,0.08)' : 'rgba(74,222,128,0.06)';
   ctx.lineWidth   = 1.5;
   ctx.setLineDash([5, 3]);
   ctx.strokeRect(rx, ry, rw, rh);
-  ctx.fillStyle = fill;
   ctx.fillRect(rx, ry, rw, rh);
   ctx.setLineDash([]);
   ctx.restore();
@@ -319,13 +314,11 @@ function drawChain() {
   if (n < 2) return;
 
   const segCount = state.closed ? n : n - 1;
-
   for (let i = 0; i < segCount; i++) {
     const a = pts[i];
     const b = pts[(i + 1) % n];
-
     const isHovered     = (i === hoveredSegIdx);
-    const isSplitTarget = (currentTool === 'split' && i === hoveredSegIdx);
+    const isSplitTarget = (currentTool === 'split' && isHovered);
 
     ctx.beginPath();
     ctx.moveTo(a.x, a.y);
@@ -365,11 +358,10 @@ function drawPoints() {
       ctx.stroke();
     }
 
-    const insideEraseRect = (currentTool === 'erase' && zoomRect !== null)
-      ? isPointInEraseRect(p) : false;
+    const inEraseRect = (currentTool === 'erase' && zoomRect !== null) && isPointInEraseRect(p);
 
     let fill = '#00e5ff';
-    if (insideEraseRect)                           fill = '#ff4444';
+    if (inEraseRect)                               fill = '#ff4444';
     else if (isHovered && currentTool === 'erase') fill = '#ff4444';
     else if (isHovered)                            fill = '#ffaa00';
     if (isSelected) fill = '#ffffff';
@@ -391,19 +383,18 @@ function drawPoints() {
   });
 }
 
-// -- Hit testing ---------------------------------------------------------------
+// ── Hit testing ───────────────────────────────────────────────────────────────
 
 function isNearPoint(wx, wy, p) {
   return Math.hypot(wx - p.x, wy - p.y) < (POINT_R_HOVER + 2) / view.zoom;
 }
 
 function hitTestPoint(wx, wy) {
-  let closest = null;
-  let minDist = Infinity;
-  const threshold = (POINT_R_HOVER + 4) / view.zoom;
+  let closest = null, minDist = Infinity;
+  const thr = (POINT_R_HOVER + 4) / view.zoom;
   state.points.forEach(p => {
     const d = Math.hypot(wx - p.x, wy - p.y);
-    if (d < threshold && d < minDist) { minDist = d; closest = p; }
+    if (d < thr && d < minDist) { minDist = d; closest = p; }
   });
   return closest;
 }
@@ -412,17 +403,13 @@ function hitTestSegment(wx, wy) {
   const pts = state.points;
   const n   = pts.length;
   if (n < 2) return -1;
-
-  const threshold = 6 / view.zoom;
-  const segCount  = state.closed ? n : n - 1;
-  let closest = -1;
-  let minDist = Infinity;
-
+  const thr      = 6 / view.zoom;
+  const segCount = state.closed ? n : n - 1;
+  let closest = -1, minDist = Infinity;
   for (let i = 0; i < segCount; i++) {
-    const a = pts[i];
-    const b = pts[(i + 1) % n];
+    const a = pts[i], b = pts[(i + 1) % n];
     const d = pointToSegmentDist(wx, wy, a.x, a.y, b.x, b.y);
-    if (d < threshold && d < minDist) { minDist = d; closest = i; }
+    if (d < thr && d < minDist) { minDist = d; closest = i; }
   }
   return closest;
 }
@@ -453,12 +440,12 @@ function isPointInEraseRect(p) {
   return ps.x >= minSx && ps.x <= maxSx && ps.y >= minSy && ps.y <= maxSy;
 }
 
-// -- Mouse events --------------------------------------------------------------
+// ── Mouse events ──────────────────────────────────────────────────────────────
 
 canvas.addEventListener('mousemove', e => {
   const rect = canvas.getBoundingClientRect();
-  const sx = e.clientX - rect.left;
-  const sy = e.clientY - rect.top;
+  const sx   = e.clientX - rect.left;
+  const sy   = e.clientY - rect.top;
   mouseWorld     = screenToWorld(sx, sy);
   mouseWorld._sx = sx;
   mouseWorld._sy = sy;
@@ -491,7 +478,6 @@ canvas.addEventListener('mousemove', e => {
     const hit = hitTestPoint(mouseWorld.x, mouseWorld.y);
     canvas.style.cursor = isDragging ? 'grabbing' : (hit ? 'grab' : 'default');
   }
-
   if (currentTool === 'erase' && zoomRect !== null) {
     canvas.style.cursor = 'crosshair';
   }
@@ -529,88 +515,70 @@ canvas.addEventListener('mousedown', e => {
     return;
   }
 
-  if (e.button === 0) {
-    if (currentTool === 'add') {
-      const hit = hitTestPoint(w.x, w.y);
-      if (hit) {
-        state.selectedId = hit.id;
-        updateSidebar();
-        render();
-      } else {
-        addPointAt(+w.x.toFixed(4), +w.y.toFixed(4));
-      }
-    } else if (currentTool === 'select') {
-      const hit = hitTestPoint(w.x, w.y);
-      if (hit) {
-        isDragging   = true;
-        dragId       = hit.id;
-        dragOffsetX  = w.x - hit.x;
-        dragOffsetY  = w.y - hit.y;
-        dragHasMoved = false;
-        dragBefore   = snapState();
-        state.selectedId = hit.id;
-        canvas.style.cursor = 'grabbing';
-        updateSidebar();
-        render();
-      } else {
-        state.selectedId = null;
-        updateSidebar();
-        render();
-      }
-    } else if (currentTool === 'split') {
-      const segIdx = hitTestSegment(w.x, w.y);
-      if (segIdx >= 0) {
-        const n  = state.points.length;
-        const a  = state.points[segIdx];
-        const b  = state.points[(segIdx + 1) % n];
-        const pt = projectOnSegment(w.x, w.y, a.x, a.y, b.x, b.y);
-        splitSegment(segIdx, pt.x, pt.y);
-      }
-    } else if (currentTool === 'zoom') {
-      const canvasRect = canvas.getBoundingClientRect();
-      zoomRect = { sx: e.clientX - canvasRect.left, sy: e.clientY - canvasRect.top };
-      canvas.style.cursor = 'crosshair';
-    } else if (currentTool === 'erase') {
-      const hit = hitTestPoint(w.x, w.y);
-      if (hit) {
-        erasePoint(hit.id);
-      } else {
-        const canvasRect = canvas.getBoundingClientRect();
-        zoomRect = { sx: e.clientX - canvasRect.left, sy: e.clientY - canvasRect.top };
-      }
+  if (e.button !== 0) return;
+
+  if (currentTool === 'add') {
+    const hit = hitTestPoint(w.x, w.y);
+    if (hit) { state.selectedId = hit.id; updateSidebar(); render(); }
+    else     { addPointAt(+w.x.toFixed(4), +w.y.toFixed(4)); }
+
+  } else if (currentTool === 'select') {
+    const hit = hitTestPoint(w.x, w.y);
+    if (hit) {
+      isDragging = true; dragId = hit.id;
+      dragOffsetX = w.x - hit.x; dragOffsetY = w.y - hit.y;
+      dragHasMoved = false; dragBefore = snapState();
+      state.selectedId = hit.id;
+      canvas.style.cursor = 'grabbing';
+      updateSidebar(); render();
+    } else {
+      state.selectedId = null; updateSidebar(); render();
+    }
+
+  } else if (currentTool === 'split') {
+    const segIdx = hitTestSegment(w.x, w.y);
+    if (segIdx >= 0) {
+      const n  = state.points.length;
+      const a  = state.points[segIdx];
+      const b  = state.points[(segIdx + 1) % n];
+      const pt = projectOnSegment(w.x, w.y, a.x, a.y, b.x, b.y);
+      splitSegment(segIdx, pt.x, pt.y);
+    }
+
+  } else if (currentTool === 'zoom') {
+    const cr = canvas.getBoundingClientRect();
+    zoomRect = { sx: e.clientX - cr.left, sy: e.clientY - cr.top };
+    canvas.style.cursor = 'crosshair';
+
+  } else if (currentTool === 'erase') {
+    const hit = hitTestPoint(w.x, w.y);
+    if (hit) {
+      erasePoint(hit.id);
+    } else {
+      const cr = canvas.getBoundingClientRect();
+      zoomRect = { sx: e.clientX - cr.left, sy: e.clientY - cr.top };
     }
   }
 });
 
 canvas.addEventListener('mouseup', async e => {
   if (currentTool === 'erase' && zoomRect !== null && e.button === 0) {
-    const canvasRect = canvas.getBoundingClientRect();
-    const ex = e.clientX - canvasRect.left;
-    const ey = e.clientY - canvasRect.top;
-    const rw = Math.abs(ex - zoomRect.sx);
-    const rh = Math.abs(ey - zoomRect.sy);
-
-    if (rw > 4 && rh > 4) {
+    const cr = canvas.getBoundingClientRect();
+    const ex = e.clientX - cr.left, ey = e.clientY - cr.top;
+    if (Math.abs(ex - zoomRect.sx) > 4 && Math.abs(ey - zoomRect.sy) > 4) {
       const toDelete = state.points.filter(p => isPointInEraseRect(p)).map(p => p.id);
       if (toDelete.length > 0) await erasePointSet(toDelete);
     }
-    zoomRect = null;
-    render();
-    return;
+    zoomRect = null; render(); return;
   }
 
   if (currentTool === 'zoom' && zoomRect !== null && e.button === 0) {
-    const canvasRect = canvas.getBoundingClientRect();
-    const ex   = e.clientX - canvasRect.left;
-    const ey   = e.clientY - canvasRect.top;
+    const cr = canvas.getBoundingClientRect();
+    const ex = e.clientX - cr.left, ey = e.clientY - cr.top;
     const minSx = Math.min(zoomRect.sx, ex), maxSx = Math.max(zoomRect.sx, ex);
     const minSy = Math.min(zoomRect.sy, ey), maxSy = Math.max(zoomRect.sy, ey);
-    if (maxSx - minSx > 4 && maxSy - minSy > 4) {
-      applyZoomWindow(minSx, minSy, maxSx, maxSy);
-    }
-    zoomRect = null;
-    render();
-    return;
+    if (maxSx - minSx > 4 && maxSy - minSy > 4) applyZoomWindow(minSx, minSy, maxSx, maxSy);
+    zoomRect = null; render(); return;
   }
 
   if (isPanning) {
@@ -621,7 +589,6 @@ canvas.addEventListener('mouseup', async e => {
   if (isDragging) {
     isDragging = false;
     canvas.style.cursor = 'grab';
-
     if (dragHasMoved && dragId !== null) {
       const pt = state.points.find(p => p.id === dragId);
       if (pt) {
@@ -631,15 +598,10 @@ canvas.addEventListener('mouseup', async e => {
           commitUndo();
           syncActiveToMulti();
           updateSidebar();
-        } catch (err) {
-          toast('Errore salvataggio posizione: ' + err.message, true);
-        }
+        } catch (err) { toast('Errore salvataggio: ' + err.message, true); }
       }
     }
-
-    dragId       = null;
-    dragBefore   = null;
-    dragHasMoved = false;
+    dragId = null; dragBefore = null; dragHasMoved = false;
   }
 });
 
@@ -649,36 +611,30 @@ canvas.addEventListener('wheel', e => {
   const sx     = e.clientX - rect.left;
   const sy     = e.clientY - rect.top;
   const factor = e.deltaY < 0 ? 1.1 : 0.909;
-
   view.panX = sx - (sx - view.panX) * factor;
   view.panY = sy - (sy - view.panY) * factor;
   view.zoom = view.zoom * factor;
-
   render();
 }, { passive: false });
 
 canvas.addEventListener('contextmenu', e => e.preventDefault());
 
-// -- Tool switching ------------------------------------------------------------
+// ── Tool switching ────────────────────────────────────────────────────────────
 
 function setTool(tool) {
-  currentTool   = tool;
-  hoveredSegIdx = -1;
-  ghostPoint    = null;
-  zoomRect      = null;
+  currentTool = tool; hoveredSegIdx = -1; ghostPoint = null; zoomRect = null;
 
-  document.getElementById('toolAdd').classList.toggle('active',    tool === 'add');
-  document.getElementById('toolSelect').classList.toggle('active', tool === 'select');
-  document.getElementById('toolSplit').classList.toggle('active',  tool === 'split');
-  document.getElementById('toolZoom').classList.toggle('active',   tool === 'zoom');
-  document.getElementById('toolErase').classList.toggle('active',  tool === 'erase');
+  ['add','select','split','zoom','erase'].forEach(t => {
+    document.getElementById('tool' + t.charAt(0).toUpperCase() + t.slice(1))
+      .classList.toggle('active', t === tool);
+  });
 
-  const labels  = { add: 'AGGIUNGI', select: 'SELEZIONA', split: 'SPEZZA',
-                    zoom: 'ZOOM FINESTRA', erase: 'CANCELLA' };
+  const labels  = { add:'AGGIUNGI', select:'SELEZIONA', split:'SPEZZA',
+                    zoom:'ZOOM FINESTRA', erase:'CANCELLA' };
   document.getElementById('modeLbl').textContent = labels[tool] || tool.toUpperCase();
 
-  const cursors = { add: 'crosshair', select: 'default', split: 'crosshair',
-                    zoom: 'crosshair', erase: 'cell' };
+  const cursors = { add:'crosshair', select:'default', split:'crosshair',
+                    zoom:'crosshair', erase:'cell' };
   canvas.style.cursor = cursors[tool] || 'default';
 
   const hints = {
@@ -691,11 +647,9 @@ function setTool(tool) {
   document.getElementById('hintText').innerHTML = hints[tool] || '';
 }
 
-document.getElementById('toolAdd').addEventListener('click',    () => setTool('add'));
-document.getElementById('toolSelect').addEventListener('click', () => setTool('select'));
-document.getElementById('toolSplit').addEventListener('click',  () => setTool('split'));
-document.getElementById('toolZoom').addEventListener('click',   () => setTool('zoom'));
-document.getElementById('toolErase').addEventListener('click',  () => setTool('erase'));
+['Add','Select','Split','Zoom','Erase'].forEach(t => {
+  document.getElementById('tool' + t).addEventListener('click', () => setTool(t.toLowerCase()));
+});
 
 document.addEventListener('keydown', e => {
   if (e.target.tagName === 'INPUT') return;
@@ -711,24 +665,18 @@ document.addEventListener('keydown', e => {
     if (e.key === 'd' || e.key === 'D') setTool('erase');
     if (e.key === 'r' || e.key === 'R') zoomReset();
   }
-
-  if (e.key === 'Escape') {
-    state.selectedId = null;
-    render();
-    updateSidebar();
-  }
+  if (e.key === 'Escape') { state.selectedId = null; render(); updateSidebar(); }
   if ((e.key === 'Delete' || e.key === 'Backspace') && state.selectedId) {
     deletePoint(state.selectedId);
   }
 });
 
-// -- API helpers ---------------------------------------------------------------
+// ── API helpers ───────────────────────────────────────────────────────────────
 
 async function apiPost(url, body) {
   const res = await fetch(url, {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body),
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -736,9 +684,8 @@ async function apiPost(url, body) {
 
 async function apiPut(url, body) {
   const res = await fetch(url, {
-    method:  'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body),
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -746,9 +693,8 @@ async function apiPut(url, body) {
 
 async function apiPatch(url, body) {
   const res = await fetch(url, {
-    method:  'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify(body),
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
@@ -760,12 +706,9 @@ async function apiDelete(url) {
   return res.json();
 }
 
-// -- Sync helpers --------------------------------------------------------------
+// ── Sync helpers ──────────────────────────────────────────────────────────────
 
-/**
- * Copia i dati del percorso attivo da state -> multiState.paths.
- * Chiamata dopo ogni operazione di editing sul percorso attivo.
- */
+/** Dopo ogni modifica al percorso attivo: aggiorna la copia in multiState. */
 function syncActiveToMulti() {
   const ap = multiState.paths.find(p => p.id === multiState.activePathId);
   if (!ap) return;
@@ -773,16 +716,11 @@ function syncActiveToMulti() {
   ap.closed = state.closed;
 }
 
-/**
- * Carica il percorso attivo da multiState -> state.
- * Chiamata dopo aver cambiato activePathId.
- */
+/** Dopo cambio percorso attivo: carica i dati da multiState in state. */
 function loadActiveFromMulti() {
   const ap = multiState.paths.find(p => p.id === multiState.activePathId);
   if (!ap) {
-    state.points     = [];
-    state.closed     = false;
-    state.selectedId = null;
+    state.points = []; state.closed = false; state.selectedId = null;
     return;
   }
   state.points     = ap.points.map(p => ({ ...p }));
@@ -790,18 +728,18 @@ function loadActiveFromMulti() {
   state.selectedId = null;
 }
 
-// -- Caricamento iniziale ------------------------------------------------------
+// ── Caricamento iniziale ──────────────────────────────────────────────────────
 
 async function loadStateFromServer() {
   const data = await fetch('/api/path/paths/fullstate').then(r => r.json());
-  multiState.paths        = data.paths || [];
+  multiState.paths        = data.paths  || [];
   multiState.activePathId = data.activePathId || null;
   loadActiveFromMulti();
-  if (state.points.length > 0) fitView();
+  if (multiState.paths.flatMap(p => p.points).length > 0) fitView();
   updateUI();
 }
 
-// -- Point operations ----------------------------------------------------------
+// ── Point operations ──────────────────────────────────────────────────────────
 
 async function addPointAt(x, y) {
   const before = snapState();
@@ -809,14 +747,10 @@ async function addPointAt(x, y) {
     const data = await apiPost('/api/path/point', { x, y });
     state.points.push(data.point);
     state.selectedId = data.point.id;
-    pushUndo(before);
-    commitUndo();
-    syncActiveToMulti();
-    updateUI();
+    pushUndo(before); commitUndo();
+    syncActiveToMulti(); updateUI();
     toast('Punto #' + data.point.id + ' aggiunto (' + x + ', ' + y + ')');
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
 async function addPointFromInputs() {
@@ -832,14 +766,10 @@ async function deletePoint(id) {
     await apiDelete('/api/path/point/' + id);
     state.points = state.points.filter(p => p.id !== id);
     if (state.selectedId === id) state.selectedId = null;
-    pushUndo(before);
-    commitUndo();
-    syncActiveToMulti();
-    updateUI();
+    pushUndo(before); commitUndo();
+    syncActiveToMulti(); updateUI();
     toast('Punto #' + id + ' eliminato');
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
 async function erasePoint(id) {
@@ -848,33 +778,22 @@ async function erasePoint(id) {
     await apiDelete('/api/path/point/' + id);
     state.points = state.points.filter(p => p.id !== id);
     if (state.selectedId === id) state.selectedId = null;
-    pushUndo(before);
-    commitUndo();
-    syncActiveToMulti();
-    updateUI();
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+    pushUndo(before); commitUndo();
+    syncActiveToMulti(); updateUI();
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
 async function erasePointSet(ids) {
   if (!ids.length) return;
   const before = snapState();
   try {
-    for (const id of ids) {
-      await apiDelete('/api/path/point/' + id);
-    }
+    for (const id of ids) await apiDelete('/api/path/point/' + id);
     state.points = state.points.filter(p => !ids.includes(p.id));
     if (ids.includes(state.selectedId)) state.selectedId = null;
-    pushUndo(before);
-    commitUndo();
-    syncActiveToMulti();
-    updateUI();
-    toast(ids.length + ' punt' + (ids.length === 1 ? 'o' : 'i') +
-          ' eliminat' + (ids.length === 1 ? 'o' : 'i'));
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+    pushUndo(before); commitUndo();
+    syncActiveToMulti(); updateUI();
+    toast(ids.length + ' punt' + (ids.length === 1 ? 'o eliminato' : 'i eliminati'));
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
 async function splitSegment(segIdx, x, y) {
@@ -884,17 +803,13 @@ async function splitSegment(segIdx, x, y) {
     state.points.splice(segIdx + 1, 0, data.point);
     state.selectedId = data.point.id;
     ghostPoint = null;
-    pushUndo(before);
-    commitUndo();
-    syncActiveToMulti();
-    updateUI();
-    toast('Segmento spezzato: nuovo punto #' + data.point.id + ' (' + x + ', ' + y + ')');
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+    pushUndo(before); commitUndo();
+    syncActiveToMulti(); updateUI();
+    toast('Segmento spezzato: nuovo punto #' + data.point.id);
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
-// -- Closed toggle -------------------------------------------------------------
+// ── Closed toggle ─────────────────────────────────────────────────────────────
 
 async function toggleClosed() {
   const newVal = !state.closed;
@@ -902,60 +817,43 @@ async function toggleClosed() {
     await apiPatch('/api/path/closed', { closed: newVal });
     state.closed = newVal;
     syncActiveToMulti();
-    updateClosedButton();
-    updateSegmentCount();
-    render();
+    updateClosedButton(); updateSegmentCount(); render();
     toast(newVal ? 'Percorso chiuso' : 'Percorso aperto');
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
 function updateClosedButton() {
   const btn = document.getElementById('btnClosed');
-  if (state.closed) {
-    btn.textContent       = 'Apri percorso';
-    btn.style.borderColor = '#a78bfa';
-    btn.style.color       = '#a78bfa';
-  } else {
-    btn.textContent       = 'Chiudi percorso';
-    btn.style.borderColor = '';
-    btn.style.color       = '';
-  }
+  btn.textContent       = state.closed ? 'Apri percorso' : 'Chiudi percorso';
+  btn.style.borderColor = state.closed ? '#a78bfa' : '';
+  btn.style.color       = state.closed ? '#a78bfa' : '';
 }
 
 function updateSegmentCount() {
-  const n        = state.points.length;
-  const segCount = n < 2 ? 0 : (state.closed ? n : n - 1);
-  document.getElementById('statSegs').textContent = segCount;
+  const n = state.points.length;
+  document.getElementById('statSegs').textContent =
+    n < 2 ? 0 : (state.closed ? n : n - 1);
 }
 
-// -- Multi-path operations -----------------------------------------------------
+// ── Multi-path operations ─────────────────────────────────────────────────────
 
-/**
- * Crea un nuovo percorso vuoto sul server e lo rende attivo.
- */
 async function newPath() {
-  const name   = prompt('Nome del nuovo percorso:', 'Percorso ' + (multiState.paths.length + 1));
-  if (!name) return;
-  const before = snapState();
+  const name = prompt('Nome del nuovo percorso:', 'Percorso ' + (multiState.paths.length + 1));
+  if (name === null) return;   // annullato
+  const safeName = name.trim() || ('Percorso ' + (multiState.paths.length + 1));
+  const before   = snapState();
   try {
-    const data = await apiPost('/api/path/paths', { name });
+    const data = await apiPost('/api/path/paths', { name: safeName });
+    // Il server ritorna pathMeta (senza points), aggiungiamo points: []
     multiState.paths.push({ ...data.path, points: [] });
     multiState.activePathId = data.activePathId;
     loadActiveFromMulti();
-    pushUndo(before);
-    commitUndo();
+    pushUndo(before); commitUndo();
     updateUI();
-    toast('Nuovo percorso: ' + name);
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+    toast('Nuovo percorso: ' + safeName);
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
-/**
- * Attiva un percorso esistente per l'editing.
- */
 async function activatePath(pid) {
   if (pid === multiState.activePathId) return;
   try {
@@ -963,68 +861,49 @@ async function activatePath(pid) {
     multiState.activePathId = pid;
     loadActiveFromMulti();
     updateUI();
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
-/**
- * Rinomina un percorso (prompt inline).
- */
 async function renamePath(pid) {
   const path = multiState.paths.find(p => p.id === pid);
   if (!path) return;
   const newName = prompt('Rinomina percorso:', path.name);
-  if (!newName || newName === path.name) return;
+  if (newName === null || newName.trim() === path.name) return;
+  const trimmed = newName.trim() || path.name;
   try {
-    await apiPatch('/api/path/paths/' + pid, { name: newName });
-    path.name = newName;
+    await apiPatch('/api/path/paths/' + pid, { name: trimmed });
+    path.name = trimmed;
     updatePathList();
-    toast('Percorso rinominato: ' + newName);
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+    toast('Rinominato: ' + trimmed);
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
-/**
- * Elimina un percorso (con conferma).
- */
 async function deletePath(pid) {
   const path = multiState.paths.find(p => p.id === pid);
   if (!path) return;
   if (!confirm('Eliminare il percorso "' + path.name + '"?')) return;
-
   const before = snapState();
   try {
     const data = await apiDelete('/api/path/paths/' + pid);
-    multiState.paths = multiState.paths.filter(p => p.id !== pid);
+    multiState.paths        = multiState.paths.filter(p => p.id !== pid);
     multiState.activePathId = data.activePathId;
     loadActiveFromMulti();
-    pushUndo(before);
-    commitUndo();
+    pushUndo(before); commitUndo();
     updateUI();
     toast('Percorso "' + path.name + '" eliminato');
-  } catch (err) {
-    toast('Errore: ' + err.message, true);
-  }
+  } catch (err) { toast('Errore: ' + err.message, true); }
 }
 
-/**
- * Scarica il CSV di un percorso specifico.
- */
 function savePathCsv(pid) {
   window.location.href = '/api/path/paths/' + pid + '/save';
   toast('Download CSV avviato');
 }
 
-/**
- * Carica un CSV come nuovo percorso aggiuntivo (non sostituisce).
- */
 function loadPathCsv() {
   document.getElementById('fileInputAdd').click();
 }
 
-// -- UI update -----------------------------------------------------------------
+// ── UI update ─────────────────────────────────────────────────────────────────
 
 function updateUI() {
   updatePathList();
@@ -1037,31 +916,33 @@ function updatePathList() {
   const list = document.getElementById('pathList');
   list.innerHTML = '';
 
+  if (multiState.paths.length === 0) {
+    list.innerHTML = '<div style="padding:10px 12px;color:var(--dim);font-size:11px">Nessun percorso</div>';
+    return;
+  }
+
   multiState.paths.forEach(path => {
     const isActive = path.id === multiState.activePathId;
-    const color    = pathColor(path.id);
+    const color    = colorForId(path.id);
 
     const item = document.createElement('div');
     item.className = 'path-item' + (isActive ? ' active' : '');
-    item.style.setProperty('--path-color', color);
 
     item.innerHTML =
-      '<span class="path-dot"></span>' +
+      '<span class="path-dot" style="background:' + (isActive ? 'var(--accent)' : color) + '"></span>' +
       '<span class="path-name">' + escHtml(path.name) + '</span>' +
       '<span class="path-count">' + path.points.length + 'pt</span>' +
       '<button class="path-btn" data-action="rename" title="Rinomina">&#x270E;</button>' +
       '<button class="path-btn" data-action="save"   title="Salva CSV">&#x2193;</button>' +
-      '<button class="path-btn path-btn-del" data-action="delete" title="Elimina">&#xD7;</button>';
+      '<button class="path-btn path-btn-del" data-action="delete" title="Elimina percorso">&#xD7;</button>';
 
-    // Click sulla riga = attiva il percorso
     item.addEventListener('click', e => {
-      if (e.target.dataset.action) return;   // gestito dai bottoni
+      if (e.target.dataset.action) return;
       activatePath(path.id);
     });
-
-    item.querySelector('[data-action="rename"]').addEventListener('click', () => renamePath(path.id));
-    item.querySelector('[data-action="save"]').addEventListener('click',   () => savePathCsv(path.id));
-    item.querySelector('[data-action="delete"]').addEventListener('click', () => deletePath(path.id));
+    item.querySelector('[data-action="rename"]').addEventListener('click', e => { e.stopPropagation(); renamePath(path.id); });
+    item.querySelector('[data-action="save"]').addEventListener('click',   e => { e.stopPropagation(); savePathCsv(path.id); });
+    item.querySelector('[data-action="delete"]').addEventListener('click', e => { e.stopPropagation(); deletePath(path.id); });
 
     list.appendChild(item);
   });
@@ -1078,7 +959,6 @@ function updateSidebar() {
       '<span class="pt-id">#' + p.id + '</span>' +
       '<span class="pt-coords">' + p.x.toFixed(4) + ', ' + p.y.toFixed(4) + '</span>' +
       '<button class="pt-del" title="Elimina">&#xD7;</button>';
-
     item.addEventListener('click', e => {
       if (e.target.classList.contains('pt-del')) return;
       state.selectedId = p.id;
@@ -1089,8 +969,8 @@ function updateSidebar() {
     list.appendChild(item);
   });
 
-  document.getElementById('ptCount').textContent  = state.points.length;
-  document.getElementById('statPts').textContent   = state.points.length;
+  document.getElementById('ptCount').textContent = state.points.length;
+  document.getElementById('statPts').textContent  = state.points.length;
   updateSegmentCount();
 }
 
@@ -1101,15 +981,13 @@ function centerOnPoint(p) {
 
 function escHtml(str) {
   return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// -- File I/O ------------------------------------------------------------------
+// ── File I/O ──────────────────────────────────────────────────────────────────
 
-// Carica CSV nel percorso attivo (comportamento legacy - sostituisce i punti)
+// Carica CSV nel percorso ATTIVO (sostituisce i punti del percorso corrente)
 document.getElementById('btnLoad').addEventListener('click', () => {
   document.getElementById('fileInput').click();
 });
@@ -1123,28 +1001,28 @@ document.getElementById('fileInput').addEventListener('change', async e => {
     const res = await fetch('/api/path/load', { method: 'POST', body: formData });
     if (!res.ok) throw new Error(await res.text());
     const s = await res.json();
-    state.points     = s.points;
-    state.closed     = s.closed;
-    state.selectedId = null;
+    state.points = s.points; state.closed = s.closed; state.selectedId = null;
     syncActiveToMulti();
-    // Aggiorna anche il nome nella lista
+    // Il server aggiorna il nome del percorso: ricarica i metadati
     const ap = multiState.paths.find(p => p.id === multiState.activePathId);
-    if (ap) updatePathList();
-    fitView();
-    updateUI();
+    if (ap) {
+      const meta = await fetch('/api/path/paths').then(r => r.json());
+      const updated = meta.paths.find(p => p.id === multiState.activePathId);
+      if (updated) ap.name = updated.name;
+    }
+    fitView(); updateUI();
     toast('Caricati ' + s.points.length + ' punti da ' + file.name);
-  } catch (err) {
-    toast('Errore caricamento: ' + err.message, true);
-  }
+  } catch (err) { toast('Errore: ' + err.message, true); }
   e.target.value = '';
 });
 
-// Carica CSV come NUOVO percorso aggiuntivo
+// Carica CSV come NUOVO percorso aggiuntivo (non tocca gli altri)
 document.getElementById('fileInputAdd').addEventListener('change', async e => {
   const file = e.target.files[0];
   if (!file) return;
   const formData = new FormData();
   formData.append('file', file);
+  const before = snapState();
   try {
     const res = await fetch('/api/path/paths/load', { method: 'POST', body: formData });
     if (!res.ok) throw new Error(await res.text());
@@ -1152,32 +1030,28 @@ document.getElementById('fileInputAdd').addEventListener('change', async e => {
     multiState.paths.push(data.path);
     multiState.activePathId = data.activePathId;
     loadActiveFromMulti();
-    fitView();
-    updateUI();
-    toast('Aggiunto percorso "' + data.path.name + '" (' + data.path.points.length + ' punti)');
-  } catch (err) {
-    toast('Errore caricamento: ' + err.message, true);
-  }
+    pushUndo(before); commitUndo();
+    fitView(); updateUI();
+    toast('Aggiunto: "' + data.path.name + '" (' + data.path.points.length + ' punti)');
+  } catch (err) { toast('Errore: ' + err.message, true); }
   e.target.value = '';
 });
 
 document.getElementById('btnSave').addEventListener('click', () => {
-  window.location.href = '/api/path/save';
-  toast('Download CSV avviato');
+  if (multiState.activePathId === null) { toast('Nessun percorso attivo', true); return; }
+  savePathCsv(multiState.activePathId);
 });
 
-document.getElementById('btnNewPath').addEventListener('click', newPath);
-document.getElementById('btnLoadPath').addEventListener('click', loadPathCsv);
+document.getElementById('btnNewPath').addEventListener('click',   newPath);
+document.getElementById('btnLoadPath').addEventListener('click',  loadPathCsv);
 
 document.getElementById('btnClear').addEventListener('click', async () => {
   if (!confirm('Svuotare il disegno? Tutti i percorsi saranno eliminati.')) return;
   await apiDelete('/api/path/clear');
-  multiState.paths        = [];
-  multiState.activePathId = null;
-  state.points            = [];
-  state.closed            = false;
-  state.selectedId        = null;
-  updateUI();
+  multiState.paths = []; multiState.activePathId = null;
+  state.points = []; state.closed = false; state.selectedId = null;
+  undoStack.length = 0; redoStack.length = 0;
+  updateUndoButtons(); updateUI();
   toast('Disegno svuotato');
 });
 
@@ -1190,14 +1064,13 @@ document.getElementById('inputY').addEventListener('keydown', e => {
   if (e.key === 'Enter') addPointFromInputs();
 });
 
-// -- Viewport ------------------------------------------------------------------
+// ── Viewport ──────────────────────────────────────────────────────────────────
 
 function applyZoomWindow(minSx, minSy, maxSx, maxSy) {
-  const W  = canvas.width, H = canvas.height;
+  const W = canvas.width, H = canvas.height;
   const rw = maxSx - minSx, rh = maxSy - minSy;
   const newZoom = Math.min(W / rw, H / rh) * view.zoom;
-  const cx = (minSx + maxSx) / 2, cy = (minSy + maxSy) / 2;
-  const wc = screenToWorld(cx, cy);
+  const wc = screenToWorld((minSx + maxSx) / 2, (minSy + maxSy) / 2);
   view.zoom = newZoom;
   view.panX = W / 2 - wc.x * newZoom;
   view.panY = H / 2 + wc.y * newZoom;
@@ -1207,12 +1080,10 @@ function zoomReset() {
   view.zoom = lastFitView.zoom;
   view.panX = lastFitView.panX;
   view.panY = lastFitView.panY;
-  render();
-  toast('Zoom reimpostato');
+  render(); toast('Zoom reimpostato');
 }
 
 function fitView() {
-  // Calcola il bounding box su TUTTI i percorsi visibili
   const allPts = multiState.paths.flatMap(p => p.points);
   const n = allPts.length;
   if (n === 0) return;
@@ -1223,21 +1094,20 @@ function fitView() {
     view.zoom = 1;
     view.panX = W / 2 - allPts[0].x;
     view.panY = H / 2 + allPts[0].y;
-    lastFitView = { zoom: view.zoom, panX: view.panX, panY: view.panY };
+    lastFitView = { ...view };
     return;
   }
 
-  const xs   = allPts.map(p => p.x);
-  const ys   = allPts.map(p => p.y);
+  const xs = allPts.map(p => p.x), ys = allPts.map(p => p.y);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const rangeX = maxX - minX, rangeY = maxY - minY;
+  const rX = maxX - minX, rY = maxY - minY;
 
   let zoom;
-  if      (rangeX === 0 && rangeY === 0) zoom = 1;
-  else if (rangeX === 0)                 zoom = (H - pad * 2) / rangeY;
-  else if (rangeY === 0)                 zoom = (W - pad * 2) / rangeX;
-  else                                   zoom = Math.min((W - pad * 2) / rangeX, (H - pad * 2) / rangeY);
+  if      (rX === 0 && rY === 0) zoom = 1;
+  else if (rX === 0)             zoom = (H - pad * 2) / rY;
+  else if (rY === 0)             zoom = (W - pad * 2) / rX;
+  else                           zoom = Math.min((W - pad * 2) / rX, (H - pad * 2) / rY);
 
   view.zoom = zoom;
   view.panX = W / 2 - ((minX + maxX) / 2) * zoom;
@@ -1245,7 +1115,7 @@ function fitView() {
   lastFitView = { zoom: view.zoom, panX: view.panX, panY: view.panY };
 }
 
-// -- Toast ---------------------------------------------------------------------
+// ── Toast ─────────────────────────────────────────────────────────────────────
 
 let toastTimer;
 function toast(msg, isErr = false) {
@@ -1256,15 +1126,13 @@ function toast(msg, isErr = false) {
   toastTimer = setTimeout(() => { el.className = ''; }, 2800);
 }
 
-// -- Init ----------------------------------------------------------------------
+// ── Init ──────────────────────────────────────────────────────────────────────
 
 resizeCanvas();
-
-function initView() {
+(function initView() {
   view.panX = canvas.width  / 2;
   view.panY = canvas.height / 2;
   view.zoom = 1;
-}
-initView();
+})();
 loadStateFromServer();
 render();

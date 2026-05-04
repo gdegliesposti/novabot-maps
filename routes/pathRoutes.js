@@ -1,22 +1,23 @@
 /**
- * pathRoutes.js
+ * routes/pathRoutes.js
  * REST API - modello multi-percorso a catena ordinata di punti.
  *
- * Struttura dello stato:
- *   {
- *     paths: [{ id, name, closed, points: [{id, x, y}] }],
+ * Montato su /api/path in server.js.
+ *
+ * Struttura dello stato in memoria:
+ *   store = {
+ *     paths:        [{ id, name, closed, points: [{id, x, y}] }],
  *     activePathId: number | null,
- *     nextPathId: number,
- *     nextPointId: number
+ *     nextPathId:   number,
+ *     nextPointId:  number
  *   }
  *
- * I segmenti sono IMPLICITI nell'ordine dell'array:
- *   segmento i = points[i] -> points[i+1]
- *   se closed=true esiste anche points[n-1] -> points[0]
+ * Route multi-percorso:  /paths/*
+ * Route editing attivo:  /state  /point  /closed  /load  /save  /clear
+ *   (retrocompatibili - operano sempre sul percorso attivo)
  *
- * Le operazioni di editing (point add/move/delete, split, closed toggle)
- * operano sempre sul percorso attivo (activePathId).
- * Le route /api/path/* sono retrocompatibili con il frontend esistente.
+ * ORDINE DELLE ROUTE: le route statiche devono precedere quelle con :pid
+ * per evitare che Express interpreti "active" o "fullstate" come id numerico.
  */
 
 const express = require('express');
@@ -25,10 +26,10 @@ const multer  = require('multer');
 const { parse }     = require('csv-parse/sync');
 const { stringify } = require('csv-stringify/sync');
 
-// -- Stato in memoria ----------------------------------------------------------
+// ── Stato in memoria ──────────────────────────────────────────────────────────
 
 let store = {
-  paths:        [],   // [{ id, name, closed, points: [{id, x, y}] }]
+  paths:        [],
   activePathId: null,
   nextPathId:   1,
   nextPointId:  1,
@@ -36,61 +37,55 @@ let store = {
 
 const upload = multer({ storage: multer.memoryStorage() });
 
-// -- Helpers interni -----------------------------------------------------------
+// ── Helpers interni ───────────────────────────────────────────────────────────
 
 function makePoint(x, y) {
   return { id: store.nextPointId++, x: Number(x), y: Number(y) };
 }
 
 function makePath(name) {
-  return { id: store.nextPathId++, name: String(name || 'Percorso'), closed: false, points: [] };
+  return {
+    id:     store.nextPathId++,
+    name:   String(name || 'Percorso'),
+    closed: false,
+    points: [],
+  };
 }
 
-/** Ritorna il percorso attivo o null. */
 function activePath() {
   if (store.activePathId === null) return null;
   return store.paths.find(p => p.id === store.activePathId) || null;
 }
 
-/** Ritorna il percorso attivo; se non esiste ne crea uno e lo attiva. */
 function ensureActivePath() {
   let ap = activePath();
   if (!ap) {
-    ap = makePath('Percorso 1');
+    ap = makePath('Percorso ' + store.nextPathId);
     store.paths.push(ap);
     store.activePathId = ap.id;
   }
   return ap;
 }
 
-/**
- * Ricalcola nextPointId come max(id)+1 su tutti i punti di tutti i percorsi.
- * Usato dopo un POST /state o /load che inietta id esterni.
- */
-function resyncPointId() {
-  let max = 0;
+function resyncCounters() {
+  let maxPid = 0, maxPtId = 0;
   store.paths.forEach(path => {
-    path.points.forEach(p => { if (p.id > max) max = p.id; });
+    if (path.id > maxPid) maxPid = path.id;
+    path.points.forEach(p => { if (p.id > maxPtId) maxPtId = p.id; });
   });
-  store.nextPointId = max + 1;
+  store.nextPathId   = maxPid   + 1;
+  store.nextPointId  = maxPtId  + 1;
 }
 
-/**
- * Analizza un buffer CSV e ritorna un array di punti {x, y} (senza id).
- * Supporta header opzionale X,Y (case-insensitive) e dati senza header.
- */
 function parseCsvBuffer(buffer) {
   const text      = buffer.toString('utf-8');
   const firstLine = text.split(/\r?\n/).find(l => l.trim() !== '');
   const firstCell = firstLine ? firstLine.split(',')[0].trim() : '';
   const hasHeader = firstCell !== '' && isNaN(Number(firstCell));
 
-  let records;
-  if (hasHeader) {
-    records = parse(text, { columns: true, skip_empty_lines: true, trim: true });
-  } else {
-    records = parse(text, { columns: false, skip_empty_lines: true, trim: true });
-  }
+  const records = hasHeader
+    ? parse(text, { columns: true,  skip_empty_lines: true, trim: true })
+    : parse(text, { columns: false, skip_empty_lines: true, trim: true });
 
   return records.map((row, idx) => {
     const x = parseFloat(hasHeader ? (row.X ?? row.x) : row[0]);
@@ -102,107 +97,80 @@ function parseCsvBuffer(buffer) {
   });
 }
 
-/** Serializza i punti di un percorso in CSV (senza header, punto decimale). */
 function serializeCsv(points) {
-  const cast = { number: value => String(value) };
-  const rows  = points.map(p => [p.x, p.y]);
-  return stringify(rows, { header: false, cast });
+  const cast = { number: v => String(v) };
+  return stringify(points.map(p => [p.x, p.y]), { header: false, cast });
 }
 
-/** Metadati pubblici di un percorso (senza array punti, per liste). */
 function pathMeta(path) {
   return { id: path.id, name: path.name, closed: path.closed, count: path.points.length };
 }
 
+function safeName(name) {
+  return String(name).replace(/[^a-zA-Z0-9_\-]/g, '_') || 'percorso';
+}
+
 // =============================================================================
-// ROUTE MULTI-PERCORSO  /api/paths/*
+// ROUTE MULTI-PERCORSO  /paths/*
+// ATTENZIONE: le route statiche (/paths/active, /paths/fullstate, /paths/load)
+// DEVONO essere registrate PRIMA di /paths/:pid altrimenti Express le
+// interpreterebbe come id.
 // =============================================================================
 
-// -- GET /api/paths ------------------------------------------------------------
-// Lista tutti i percorsi (metadati, senza array punti).
+// GET /paths ------------------------------------------------------------------
 router.get('/paths', (req, res) => {
   res.json({ paths: store.paths.map(pathMeta), activePathId: store.activePathId });
 });
 
-// -- POST /api/paths -----------------------------------------------------------
-// Crea un nuovo percorso vuoto e lo rende attivo.
-// Body: { name? }
+// POST /paths -----------------------------------------------------------------
+// Crea un nuovo percorso vuoto e lo attiva.
 router.post('/paths', (req, res) => {
-  const name = req.body.name || ('Percorso ' + store.nextPathId);
+  const name = String(req.body.name || ('Percorso ' + store.nextPathId));
   const path = makePath(name);
   store.paths.push(path);
   store.activePathId = path.id;
   res.json({ path: pathMeta(path), activePathId: store.activePathId });
 });
 
-// -- DELETE /api/paths/:pid ---------------------------------------------------
-// Elimina un percorso. Se era quello attivo, attiva il primo rimasto (o null).
-router.delete('/paths/:pid', (req, res) => {
-  const pid = parseInt(req.params.pid, 10);
-  const idx = store.paths.findIndex(p => p.id === pid);
-  if (idx === -1) return res.status(404).json({ error: 'Percorso ' + pid + ' non trovato' });
+// GET /paths/fullstate --------------------------------------------------------
+// Stato completo (tutti i percorsi con punti). Usato dall'init frontend.
+router.get('/paths/fullstate', (req, res) => {
+  res.json({ paths: store.paths, activePathId: store.activePathId });
+});
 
-  store.paths.splice(idx, 1);
-
-  if (store.activePathId === pid) {
-    store.activePathId = store.paths.length > 0 ? store.paths[0].id : null;
+// POST /paths/fullstate -------------------------------------------------------
+// Sostituisce l'intero stato (undo/redo multi-percorso).
+router.post('/paths/fullstate', (req, res) => {
+  const { paths, activePathId } = req.body;
+  if (!Array.isArray(paths)) {
+    return res.status(400).json({ error: 'paths deve essere un array' });
   }
-
-  res.json({ ok: true, activePathId: store.activePathId });
+  store.paths        = paths;
+  store.activePathId = activePathId !== undefined ? activePathId : store.activePathId;
+  resyncCounters();
+  res.json({ ok: true });
 });
 
-// -- PATCH /api/paths/:pid ----------------------------------------------------
-// Aggiorna name e/o closed di un percorso.
-// Body: { name?, closed? }
-router.patch('/paths/:pid', (req, res) => {
-  const pid  = parseInt(req.params.pid, 10);
-  const path = store.paths.find(p => p.id === pid);
-  if (!path) return res.status(404).json({ error: 'Percorso ' + pid + ' non trovato' });
-
-  if (req.body.name !== undefined)   path.name   = String(req.body.name);
-  if (req.body.closed !== undefined) path.closed = !!req.body.closed;
-
-  res.json(pathMeta(path));
-});
-
-// -- GET /api/paths/active ----------------------------------------------------
-// Ritorna id e dati completi del percorso attivo.
+// GET /paths/active -----------------------------------------------------------
+// Metadati + punti del percorso attivo.
 router.get('/paths/active', (req, res) => {
   const ap = activePath();
-  if (!ap) return res.json({ activePathId: null, path: null });
-  res.json({ activePathId: store.activePathId, path: ap });
+  res.json({ activePathId: store.activePathId, path: ap || null });
 });
 
-// -- PUT /api/paths/active ----------------------------------------------------
-// Cambia il percorso attivo.
-// Body: { pathId }
+// PUT /paths/active -----------------------------------------------------------
+// Cambia il percorso attivo. Body: { pathId }
 router.put('/paths/active', (req, res) => {
   const pid = parseInt(req.body.pathId, 10);
   if (!store.paths.find(p => p.id === pid)) {
     return res.status(404).json({ error: 'Percorso ' + pid + ' non trovato' });
   }
   store.activePathId = pid;
-  res.json({ activePathId: store.activePathId });
+  res.json({ activePathId: pid });
 });
 
-// -- GET /api/paths/:pid/save -------------------------------------------------
-// Scarica i punti del percorso specificato come CSV.
-router.get('/paths/:pid/save', (req, res) => {
-  const pid  = parseInt(req.params.pid, 10);
-  const path = store.paths.find(p => p.id === pid);
-  if (!path) return res.status(404).json({ error: 'Percorso ' + pid + ' non trovato' });
-
-  const csv      = serializeCsv(path.points);
-  const safeName = path.name.replace(/[^a-zA-Z0-9_\-]/g, '_');
-  res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', 'attachment; filename="' + safeName + '.csv"');
-  res.send(csv);
-});
-
-// -- POST /api/paths/load -----------------------------------------------------
-// Carica un CSV come NUOVO percorso aggiunto al disegno corrente.
-// Rende il nuovo percorso attivo.
-// Body: multipart/form-data con field "file"; opzionale field "name".
+// POST /paths/load ------------------------------------------------------------
+// Carica un CSV come NUOVO percorso (non sostituisce nulla).
 router.post('/paths/load', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nessun file ricevuto' });
   try {
@@ -218,45 +186,58 @@ router.post('/paths/load', upload.single('file'), (req, res) => {
   }
 });
 
-// -- GET /api/paths/fullstate -------------------------------------------------
-// Ritorna lo stato completo (tutti i percorsi con punti). Usato dall'init frontend.
-router.get('/paths/fullstate', (req, res) => {
-  res.json({ paths: store.paths, activePathId: store.activePathId });
+// PATCH /paths/:pid -----------------------------------------------------------
+// Aggiorna name e/o closed di un percorso.
+router.patch('/paths/:pid', (req, res) => {
+  const pid  = parseInt(req.params.pid, 10);
+  const path = store.paths.find(p => p.id === pid);
+  if (!path) return res.status(404).json({ error: 'Percorso ' + pid + ' non trovato' });
+
+  if (req.body.name   !== undefined) path.name   = String(req.body.name);
+  if (req.body.closed !== undefined) path.closed = !!req.body.closed;
+
+  res.json(pathMeta(path));
 });
 
-// -- POST /api/paths/fullstate ------------------------------------------------
-// Sostituisce l'intero stato (usato da undo/redo multi-percorso).
-// Body: { paths, activePathId }
-router.post('/paths/fullstate', (req, res) => {
-  const { paths, activePathId } = req.body;
-  if (!Array.isArray(paths)) {
-    return res.status(400).json({ error: 'paths deve essere un array' });
+// GET /paths/:pid/save --------------------------------------------------------
+// Scarica CSV del percorso specificato con nome file = nome percorso.
+router.get('/paths/:pid/save', (req, res) => {
+  const pid  = parseInt(req.params.pid, 10);
+  const path = store.paths.find(p => p.id === pid);
+  if (!path) return res.status(404).json({ error: 'Percorso ' + pid + ' non trovato' });
+
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename="' + safeName(path.name) + '.csv"');
+  res.send(serializeCsv(path.points));
+});
+
+// DELETE /paths/:pid ----------------------------------------------------------
+// Elimina un percorso. Se era attivo, attiva il primo rimasto (o null).
+router.delete('/paths/:pid', (req, res) => {
+  const pid = parseInt(req.params.pid, 10);
+  const idx = store.paths.findIndex(p => p.id === pid);
+  if (idx === -1) return res.status(404).json({ error: 'Percorso ' + pid + ' non trovato' });
+
+  store.paths.splice(idx, 1);
+
+  if (store.activePathId === pid) {
+    store.activePathId = store.paths.length > 0 ? store.paths[0].id : null;
   }
-  let maxPid = 0;
-  paths.forEach(p => { if (p.id > maxPid) maxPid = p.id; });
-
-  store.paths        = paths;
-  store.activePathId = activePathId !== undefined ? activePathId : store.activePathId;
-  store.nextPathId   = maxPid + 1;
-  resyncPointId();
-  res.json({ ok: true });
+  res.json({ ok: true, activePathId: store.activePathId });
 });
 
 // =============================================================================
-// ROUTE EDITING SUL PERCORSO ATTIVO  /api/path/*
-// Retrocompatibili con il frontend esistente.
+// ROUTE EDITING SUL PERCORSO ATTIVO  (retrocompatibili)
 // =============================================================================
 
-// -- GET /api/path/state ------------------------------------------------------
-// Ritorna { points, closed } del percorso attivo (struttura legacy).
+// GET /state ------------------------------------------------------------------
 router.get('/state', (req, res) => {
   const ap = activePath();
-  if (!ap) return res.json({ points: [], closed: false });
-  res.json({ points: ap.points, closed: ap.closed });
+  res.json(ap ? { points: ap.points, closed: ap.closed } : { points: [], closed: false });
 });
 
-// -- POST /api/path/state -----------------------------------------------------
-// Sostituisce points e closed del percorso attivo (usato da undo/redo legacy).
+// POST /state -----------------------------------------------------------------
+// Sostituisce points+closed del percorso attivo (usato da undo/redo).
 router.post('/state', (req, res) => {
   const { points, closed } = req.body;
   if (!Array.isArray(points)) {
@@ -265,13 +246,11 @@ router.post('/state', (req, res) => {
   const ap = ensureActivePath();
   ap.points = points;
   ap.closed = !!closed;
-  resyncPointId();
+  resyncCounters();
   res.json({ ok: true });
 });
 
-// -- POST /api/path/point -----------------------------------------------------
-// Aggiunge un punto al percorso attivo.
-// Body: { x, y, afterIndex? }
+// POST /point -----------------------------------------------------------------
 router.post('/point', (req, res) => {
   const { x, y, afterIndex } = req.body;
   if (x == null || y == null) {
@@ -286,12 +265,10 @@ router.post('/point', (req, res) => {
   } else {
     ap.points.splice(afterIndex + 1, 0, pt);
   }
-
   res.json({ point: pt, state: { points: ap.points, closed: ap.closed } });
 });
 
-// -- DELETE /api/path/point/:id -----------------------------------------------
-// Elimina un punto dal percorso attivo.
+// DELETE /point/:id -----------------------------------------------------------
 router.delete('/point/:id', (req, res) => {
   const id = parseInt(req.params.id, 10);
   const ap = activePath();
@@ -300,18 +277,13 @@ router.delete('/point/:id', (req, res) => {
   const idx = ap.points.findIndex(p => p.id === id);
   if (idx === -1) return res.status(404).json({ error: 'Punto ' + id + ' non trovato' });
 
-  const n          = ap.points.length;
-  const isInternal = n >= 3 && idx > 0 && idx < n - 1;
-  const isEndpoint = idx === 0 || idx === n - 1;
-
   ap.points.splice(idx, 1);
-  res.json({ ok: true, wasInternal: isInternal, wasEndpoint: isEndpoint,
-             state: { points: ap.points, closed: ap.closed } });
+  res.json({ ok: true, state: { points: ap.points, closed: ap.closed } });
 });
 
-// -- POST /api/path/point/:id/move --------------------------------------------
+// POST /point/:id/move --------------------------------------------------------
 router.post('/point/:id/move', (req, res) => {
-  const id = parseInt(req.params.id, 10);
+  const id   = parseInt(req.params.id, 10);
   const { x, y } = req.body;
   if (x == null || y == null) {
     return res.status(400).json({ error: 'x e y sono obbligatori' });
@@ -326,7 +298,7 @@ router.post('/point/:id/move', (req, res) => {
   res.json(pt);
 });
 
-// -- PATCH /api/path/closed ---------------------------------------------------
+// PATCH /closed ---------------------------------------------------------------
 router.patch('/closed', (req, res) => {
   if (typeof req.body.closed !== 'boolean') {
     return res.status(400).json({ error: 'closed deve essere boolean' });
@@ -336,9 +308,8 @@ router.patch('/closed', (req, res) => {
   res.json({ ok: true, closed: ap.closed });
 });
 
-// -- POST /api/path/load ------------------------------------------------------
-// Carica CSV SOSTITUENDO i punti del percorso attivo (comportamento legacy).
-// Se non esiste un percorso attivo, ne crea uno nuovo.
+// POST /load ------------------------------------------------------------------
+// Carica CSV NEL percorso attivo (sostituisce i punti). Comportamento legacy.
 router.post('/load', upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Nessun file ricevuto' });
   try {
@@ -346,30 +317,25 @@ router.post('/load', upload.single('file'), (req, res) => {
     const ap        = ensureActivePath();
     ap.points       = rawPoints.map(rp => makePoint(rp.x, rp.y));
     ap.closed       = false;
-    if (ap.name === 'Percorso 1' || ap.name === 'Percorso') {
-      ap.name = req.file.originalname.replace(/\.csv$/i, '');
-    }
+    ap.name         = req.file.originalname.replace(/\.csv$/i, '');
     res.json({ points: ap.points, closed: ap.closed });
   } catch (err) {
     res.status(422).json({ error: err.message });
   }
 });
 
-// -- GET /api/path/save -------------------------------------------------------
-// Scarica il percorso attivo come CSV.
+// GET /save -------------------------------------------------------------------
+// Scarica CSV del percorso attivo con nome file = nome percorso.
 router.get('/save', (req, res) => {
   const ap = activePath();
   if (!ap) return res.status(404).json({ error: 'Nessun percorso attivo' });
 
-  const csv      = serializeCsv(ap.points);
-  const safeName = ap.name.replace(/[^a-zA-Z0-9_\-]/g, '_');
   res.setHeader('Content-Type', 'text/csv');
-  res.setHeader('Content-Disposition', 'attachment; filename="' + safeName + '.csv"');
-  res.send(csv);
+  res.setHeader('Content-Disposition', 'attachment; filename="' + safeName(ap.name) + '.csv"');
+  res.send(serializeCsv(ap.points));
 });
 
-// -- DELETE /api/path/clear ---------------------------------------------------
-// Svuota TUTTI i percorsi e azzera lo stato (clear all).
+// DELETE /clear ---------------------------------------------------------------
 router.delete('/clear', (req, res) => {
   store = { paths: [], activePathId: null, nextPathId: 1, nextPointId: 1 };
   res.json({ ok: true });
