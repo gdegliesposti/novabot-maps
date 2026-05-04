@@ -15,7 +15,7 @@ identificano coordinate in metri rispetto all'origine (antenna)
 ## Struttura del progetto
 
 ```
-path-editor/
+novabot-maps/
 ├── server.js        # Entry point Express, serve static e monta le API
 ├── pathRoutes.js    # REST API: gestione punti, CSV, flag closed
 ├── public/
@@ -47,7 +47,7 @@ Uso come modulo in un server esistente:
 ```js
 const express = require('express');
 const app = express();
-app.use('/editor', require('./path-editor/pathRoutes'));
+app.use('/editor', require('./novabot-maps/pathRoutes'));
 ```
 
 ---

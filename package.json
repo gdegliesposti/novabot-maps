@@ -1,5 +1,5 @@
 {
-  "name": "path-editor",
+  "name": "novabot-maps",
   "version": "1.0.0",
   "description": "Graphical path editor for closed polygon paths",
   "main": "server.js",
